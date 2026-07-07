@@ -1,97 +1,57 @@
-import json
+import base64
 import re
 from pathlib import Path
 
 import streamlit as st
 import streamlit.components.v1 as components
 
-# ----------------------------------------------------------------------------
-# 기본 설정
-# ----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="내일 네일 - 내 주변 네일샵 찾기",
-    page_icon="💅",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+st.set_page_config(page_title="내일 네일 - 내 주변 네일샵 찾기", layout="wide")
 
 BASE_DIR = Path(__file__).parent
 HTML_PATH = BASE_DIR / "index.html"
-STATIC_DIR = BASE_DIR / "static"
-
-# 컴포넌트(iframe) 높이 — 필요하면 조절하세요.
-APP_HEIGHT = 900
+IMAGE_DIR = BASE_DIR / "image"
+IMAGE_COUNT = 42  # index.html의 THUMB_PHOTO_COUNT 값과 동일하게 맞춰주세요
 
 
-# ----------------------------------------------------------------------------
-# static 폴더 안의 네일 사진 목록을 자동으로 읽어온다.
-# 나중에 사진을 더 추가해도(static 폴더에 파일만 넣으면) 코드 수정 없이 반영됨.
-# ----------------------------------------------------------------------------
-def get_nail_images():
-    if not STATIC_DIR.exists():
-        return []
+@st.cache_data(show_spinner=False)
+def build_html() -> tuple[str, list[str]]:
+    """index.html을 읽어서 image/nail-XX.jpg 참조를 base64 데이터로 치환한다."""
+    html = HTML_PATH.read_text(encoding="utf-8")
 
-    exts = ("*.jpg", "*.jpeg", "*.png", "*.webp")
-    files = []
-    for ext in exts:
-        files.extend(STATIC_DIR.glob(ext))
+    missing = []
+    data_urls = []
+    for i in range(1, IMAGE_COUNT + 1):
+        img_path = IMAGE_DIR / f"nail-{i:02d}.jpg"
+        if img_path.exists():
+            b64 = base64.b64encode(img_path.read_bytes()).decode("utf-8")
+            data_urls.append(f"data:image/jpeg;base64,{b64}")
+        else:
+            missing.append(img_path.name)
+            data_urls.append("")  # 파일이 없으면 빈 문자열 -> onerror로 자동 숨김 처리됨
 
-    def sort_key(p: Path):
-        m = re.search(r"(\d+)", p.stem)
-        return (int(m.group(1)) if m else 0, p.name)
+    js_array = "[" + ",".join(f'"{u}"' for u in data_urls) + "]"
 
-    files = sorted(set(files), key=sort_key)
-    return [f.name for f in files]
+    # index.html 안의 THUMB_PHOTOS 생성 코드를 base64 배열로 통째로 교체
+    pattern = re.compile(r"const THUMB_PHOTOS = Array\.from\([\s\S]*?\);")
+    new_html, count = pattern.subn(f"const THUMB_PHOTOS = {js_array};", html)
+
+    if count == 0:
+        st.warning(
+            "⚠️ index.html에서 THUMB_PHOTOS 코드를 찾지 못했습니다. "
+            "index.html 원본이 수정되었다면 app.py의 치환 로직도 함께 확인해주세요."
+        )
+        new_html = html
+
+    return new_html, missing
 
 
-nail_images = get_nail_images()
+html_content, missing_images = build_html()
 
-if not nail_images:
-    st.warning(
-        "static 폴더에 네일 이미지가 없습니다. "
-        "static/ 폴더에 nail-01.jpg 처럼 이미지를 넣어주세요."
+if missing_images:
+    st.info(
+        f"이미지 {len(missing_images)}개를 찾지 못했습니다 (예: {missing_images[0]}). "
+        "`image/` 폴더에 nail-01.jpg ~ nail-27.jpg 형식으로 파일을 넣어주세요. "
+        "해당 카드의 썸네일은 배경 그라데이션만 표시됩니다."
     )
 
-# ----------------------------------------------------------------------------
-# index.html 로드 후, 로컬 image/nail-XX.jpg 참조 부분을
-# Streamlit 정적 파일 서빙 경로(/app/static/...) + 실제 이미지 목록으로 교체
-# ----------------------------------------------------------------------------
-html = HTML_PATH.read_text(encoding="utf-8")
-
-# ----------------------------------------------------------------------------
-# Leaflet CDN(unpkg.com) 링크를 static 폴더에 내장된 로컬 파일로 교체.
-# (Streamlit Cloud/iframe 환경에서 외부 CDN 스크립트가 CSP 등으로 차단되어
-#  "L is not defined" 에러가 나는 것을 방지하기 위함)
-# ----------------------------------------------------------------------------
-cdn_replacements = {
-    "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css": "/app/static/leaflet.css",
-    "https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css": "/app/static/MarkerCluster.css",
-    "https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css": "/app/static/MarkerCluster.Default.css",
-    "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js": "/app/static/leaflet.js",
-    "https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js": "/app/static/leaflet.markercluster.js",
-}
-for old_url, new_url in cdn_replacements.items():
-    html = html.replace(old_url, new_url)
-
-images_json = json.dumps(nail_images, ensure_ascii=False)
-
-old_block = """  const THUMB_PHOTO_COUNT = 27;
-  const THUMB_PHOTOS = Array.from({ length: THUMB_PHOTO_COUNT }, (_, i) =>
-    `image/nail-${String(i + 1).padStart(2, '0')}.jpg`
-  );"""
-
-new_block = f"""  const THUMB_PHOTOS_LIST = {images_json};
-  const THUMB_PHOTOS = THUMB_PHOTOS_LIST.map((f) => `/app/static/${{f}}`);"""
-
-if old_block in html:
-    html = html.replace(old_block, new_block)
-else:
-    st.error(
-        "index.html의 이미지 로딩 코드를 찾지 못했습니다. "
-        "index.html 파일이 변경되었는지 확인해주세요."
-    )
-
-# ----------------------------------------------------------------------------
-# 렌더링
-# ----------------------------------------------------------------------------
-components.html(html, height=APP_HEIGHT, scrolling=False)
+components.html(html_content, height=900, scrolling=True)
